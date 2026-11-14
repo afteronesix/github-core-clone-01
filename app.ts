@@ -37,6 +37,7 @@ import { deleteContents, getContents, putContents } from './src/rest/contents.ts
 import { createComment, createIssue, createLabel, getIssue, listComments, listIssues, patchIssue } from './src/rest/issues.ts';
 import { createPull, getPull, listPullFiles, listPulls, mergePull } from './src/rest/pulls.ts';
 import { handleGraphQL } from './src/graphql/executor.ts';
+import { handleMcp, handleMcpDelete } from './src/mcp/server.ts';
 
 /** The path + query of a request URL, or '/' when it does not parse (never a throw). */
 function urlOf(req: IncomingMessage): URL {
@@ -259,11 +260,13 @@ async function dispatch(
     return handleGraphQL(store, parseJsonBody(await readBody(req)));
   }
 
-  // --- MCP: Phase 7; unknown until then --------------------------------------
+  // --- MCP (JSON-RPC over Streamable HTTP) -----------------------------------
   if (path === '/mcp') {
-    // Read (and discard) the body so the connection stays clean, then 404.
-    await readBody(req).catch(() => Buffer.alloc(0));
-    throw notFound('Not Found');
+    if (method === 'DELETE') return handleMcpDelete();
+    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+    // handleMcp parses the raw body itself: a non-JSON body must answer
+    // HTTP 400 with JSON-RPC -32700, not the REST 400 shape.
+    return handleMcp(store, await readBody(req));
   }
 
   // Everything else, every method: GitHub's 404 body.
