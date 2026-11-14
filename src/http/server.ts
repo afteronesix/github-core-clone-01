@@ -9,6 +9,12 @@ export const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 export const JSON_TYPE = 'application/json; charset=utf-8';
 
+/** Shared empty body (a zero-chunk request resolves this, no allocation). */
+const EMPTY_BODY = Buffer.alloc(0);
+
+/** Shared empty headers (reply defaults; never mutated). */
+const NO_HEADERS: Readonly<Record<string, string>> = {};
+
 /** An error a handler throws to answer a status + JSON message body. */
 export class HttpError extends Error {
   readonly status: number;
@@ -67,7 +73,11 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('end', () => {
       if (settled) return;
       settled = true;
-      resolve(Buffer.concat(chunks));
+      // The common case is one chunk (small bodies arrive whole): return it
+      // directly instead of copying through Buffer.concat.
+      if (chunks.length === 0) resolve(EMPTY_BODY);
+      else if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else resolve(Buffer.concat(chunks));
     });
     req.on('error', fail);
   });
@@ -96,13 +106,13 @@ export interface Reply {
 }
 
 /** A JSON reply; `body` is serialized with a trailing newline. */
-export function jsonReply(status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): Reply {
+export function jsonReply(status: number, body: unknown, headers: Readonly<Record<string, string>> = NO_HEADERS): Reply {
   return { status, contentType: JSON_TYPE, body: Buffer.from(`${JSON.stringify(body)}\n`, 'utf8'), headers };
 }
 
-/** A JSON reply from an already-serialized body (the issue read cache). */
-export function jsonReplyRaw(status: number, body: string, headers: Readonly<Record<string, string>> = {}): Reply {
-  return { status, contentType: JSON_TYPE, body: Buffer.from(body, 'utf8'), headers };
+/** A JSON reply from an already-serialized body (the issue read cache stores Buffers). */
+export function jsonReplyRaw(status: number, body: string | Buffer, headers: Readonly<Record<string, string>> = NO_HEADERS): Reply {
+  return { status, contentType: JSON_TYPE, body: typeof body === 'string' ? Buffer.from(body, 'utf8') : body, headers };
 }
 
 /** A JSON error reply: `{"message": string}`. */
@@ -111,8 +121,8 @@ export function errorReply(status: number, message: string): Reply {
 }
 
 /** An empty-body reply (204). */
-export function emptyReply(status: number, headers: Readonly<Record<string, string>> = {}): Reply {
-  return { status, contentType: JSON_TYPE, body: Buffer.alloc(0), headers };
+export function emptyReply(status: number, headers: Readonly<Record<string, string>> = NO_HEADERS): Reply {
+  return { status, contentType: JSON_TYPE, body: EMPTY_BODY, headers };
 }
 
 /** Send a reply, always with a non-empty X-GitHub-Request-Id header. */
@@ -121,8 +131,8 @@ export function sendReply(res: ServerResponse, reply: Reply, requestId: string):
     'content-type': reply.contentType,
     'content-length': String(reply.body.length),
     'x-github-request-id': requestId,
-    ...(reply.headers ?? {}),
   };
+  if (reply.headers !== undefined) Object.assign(headers, reply.headers);
   res.writeHead(reply.status, headers);
   res.end(reply.body);
 }

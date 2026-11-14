@@ -13,13 +13,15 @@ export interface AuthGate {
 export function createAuthGate(token: string | undefined): AuthGate {
   const expected = (token ?? '').trim();
   const disabled = expected === '';
+  // Precomputed once: rebuilding `Bearer ${expected}` on every request was pure waste.
+  const bearer = `Bearer ${expected}`;
   return {
     disabled,
     isAuthorized(req) {
       if (disabled) return true;
       const header = req.headers.authorization;
       if (typeof header !== 'string') return false;
-      return header === `Bearer ${expected}`;
+      return header === bearer;
     },
   };
 }

@@ -145,9 +145,9 @@ export function getIssue(store: ForgeStore, owner: string, name: string, number:
   if (!issue) throw notFound('Not Found');
   const cached = repo.issueJsonCache.get(number);
   if (cached !== undefined) return jsonReplyRaw(200, cached);
-  const serialized = `${JSON.stringify(issueView(store, repo, issue))}\n`;
-  repo.issueJsonCache.set(number, serialized);
-  return jsonReplyRaw(200, serialized);
+  const body = Buffer.from(`${JSON.stringify(issueView(store, repo, issue))}\n`, 'utf8');
+  repo.issueJsonCache.set(number, body);
+  return jsonReplyRaw(200, body);
 }
 
 /** PATCH /api/v3/repos/{o}/{r}/issues/{n} — title, body, state, labels. */

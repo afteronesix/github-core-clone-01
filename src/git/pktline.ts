@@ -34,31 +34,80 @@ export function encodePktLine(payload: string | Uint8Array): Buffer {
   if (data.length > PKT_LINE_MAX_PAYLOAD) {
     throw new PktLineError(`pkt-line payload is ${data.length} bytes, over the ${PKT_LINE_MAX_PAYLOAD}-byte maximum`);
   }
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  // One allocation: header + payload in a single buffer (no Buffer.concat).
+  const out = Buffer.allocUnsafe(data.length + 4);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
+
+// Control packets are immutable 4-byte constants; callers only ever copy
+// them into larger buffers, so share one instance instead of allocating.
+const FLUSH_PACKET = Buffer.from('0000', 'ascii');
+const DELIM_PACKET = Buffer.from('0001', 'ascii');
+const RESPONSE_END_PACKET = Buffer.from('0002', 'ascii');
 
 /** The flush packet, `0000`. */
 export function pktLineFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
+  return FLUSH_PACKET;
 }
 
 /** The delim packet, `0001`. */
 export function pktLineDelim(): Buffer {
-  return Buffer.from('0001', 'ascii');
+  return DELIM_PACKET;
 }
 
-/** Encode a mixed sequence; `'flush'`/`'delim'`/`'response-end'` are the control packets. */
+/**
+ * Encode a mixed sequence; `'flush'`/`'delim'`/`'response-end'` are the control packets.
+ * Single allocation: the total length is computed up front and every packet is
+ * written straight into one buffer (no per-line Buffer, no Buffer.concat).
+ */
 export function encodePktLines(items: ReadonlyArray<string | Uint8Array | 'flush' | 'delim' | 'response-end'>): Buffer {
-  const parts: Buffer[] = [];
+  let total = 0;
   for (const item of items) {
-    if (item === 'flush') parts.push(pktLineFlush());
-    else if (item === 'delim') parts.push(pktLineDelim());
-    else if (item === 'response-end') parts.push(Buffer.from('0002', 'ascii'));
-    else parts.push(encodePktLine(item));
+    // Control packets are strings too ('flush'/'delim'/'response-end'):
+    // they must be matched BEFORE the generic string branch, or the length
+    // is over-counted and the buffer tail is uninitialized garbage.
+    if (item === 'flush' || item === 'delim' || item === 'response-end') total += 4;
+    else if (typeof item === 'string') total += 4 + Buffer.byteLength(item, 'utf8');
+    else {
+      if (item.length > PKT_LINE_MAX_PAYLOAD) {
+        throw new PktLineError(`pkt-line payload is ${item.length} bytes, over the ${PKT_LINE_MAX_PAYLOAD}-byte maximum`);
+      }
+      total += 4 + item.length;
+    }
   }
-  return Buffer.concat(parts);
+  const out = Buffer.allocUnsafe(total);
+  let offset = 0;
+  for (const item of items) {
+    if (item === 'flush') {
+      FLUSH_PACKET.copy(out, offset);
+      offset += 4;
+      continue;
+    }
+    if (item === 'delim') {
+      DELIM_PACKET.copy(out, offset);
+      offset += 4;
+      continue;
+    }
+    if (item === 'response-end') {
+      RESPONSE_END_PACKET.copy(out, offset);
+      offset += 4;
+      continue;
+    }
+    const length = typeof item === 'string' ? Buffer.byteLength(item, 'utf8') : item.length;
+    if (length > PKT_LINE_MAX_PAYLOAD) {
+      throw new PktLineError(`pkt-line payload is ${length} bytes, over the ${PKT_LINE_MAX_PAYLOAD}-byte maximum`);
+    }
+    out.write((length + 4).toString(16).padStart(4, '0'), offset, 4, 'ascii');
+    offset += 4;
+    if (typeof item === 'string') offset += out.write(item, offset, 'utf8');
+    else {
+      Buffer.from(item).copy(out, offset);
+      offset += length;
+    }
+  }
+  return out;
 }
 
 export interface DecodedPktLines {

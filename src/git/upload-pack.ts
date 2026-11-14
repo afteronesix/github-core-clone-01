@@ -28,7 +28,8 @@ function ok(contentType: string, body: Buffer): GitResponse {
 
 /** Strip one trailing `\n` from a pkt-line payload's text. */
 function lineText(payload: Buffer): string {
-  return payload.toString('utf8').replace(/\n$/, '');
+  const text = payload.toString('utf8');
+  return text.endsWith('\n') ? text.slice(0, -1) : text;
 }
 
 /** The data packets' texts, in order (control packets dropped). */
@@ -82,11 +83,7 @@ export function advertisementV0(repo: RepoRecord): GitResponse {
       if (peeled) lines.push(`${peeled} ${ref.name}^{}\n`);
     }
   }
-  const body = Buffer.concat([
-    encodePktLine('# service=git-upload-pack\n'),
-    pktLineFlush(),
-    encodePktLines([...lines, 'flush']),
-  ]);
+  const body = encodePktLines(['# service=git-upload-pack\n', 'flush', ...lines, 'flush']);
   return ok(UPLOAD_ADVERTISEMENT_TYPE, body);
 }
 
@@ -101,9 +98,12 @@ interface LsRefsArgs {
   prefixes: string[];
 }
 
-/** Parse a v2 command request: `command=<name>`, optional agent/object-format, delim, args. */
-function parseV2Command(body: Buffer, expectedCommand: string): { lines: string[] } {
-  const { packets } = decodePktLines(body);
+/**
+ * Parse a v2 command request: `command=<name>`, optional agent/object-format, delim, args.
+ * Takes the packets `handleUploadPack` already decoded — the body is decoded
+ * exactly once per request, never again inside a sub-handler.
+ */
+function parseV2Command(packets: readonly PktLine[], expectedCommand: string): { lines: string[] } {
   const lines = dataLines(packets);
   if (lines.length === 0 || lines[0] !== `command=${expectedCommand}`) {
     throw new PktLineError(`expected command=${expectedCommand}, got ${JSON.stringify(lines[0] ?? '')}`);
@@ -120,14 +120,17 @@ function parseV2Command(body: Buffer, expectedCommand: string): { lines: string[
   return { lines: args };
 }
 
+/** The ls-refs cache is bounded: a full cache is dropped rather than grown. */
+const LS_REFS_CACHE_MAX_ENTRIES = 64;
+
 /**
  * v2 ls-refs. HEAD first (with `symref-target:` when symrefs is requested;
  * `unborn HEAD` when the repo has no commits and unborn is requested), then
  * refs sorted, with `peeled:` on annotated tags when peel is requested.
  * ref-prefix filtering is SERVER-side: only matching names are returned.
  */
-export function handleLsRefs(repo: RepoRecord, body: Buffer): GitResponse {
-  const { lines } = parseV2Command(body, 'ls-refs');
+export function handleLsRefs(repo: RepoRecord, packets: readonly PktLine[]): GitResponse {
+  const { lines } = parseV2Command(packets, 'ls-refs');
   const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, prefixes: [] };
   for (const line of lines) {
     if (line === 'peel') args.peel = true;
@@ -135,6 +138,16 @@ export function handleLsRefs(repo: RepoRecord, body: Buffer): GitResponse {
     else if (line === 'unborn') args.unborn = true;
     else if (line.startsWith('ref-prefix ')) args.prefixes.push(line.slice('ref-prefix '.length));
   }
+  // Cache key: the args plus the full ref set (name=oid pairs, Map order).
+  // Same key ⟹ same ref set ⟹ same response: refs always point at existing
+  // immutable objects, so peel results are fixed for a given ref set, and
+  // the default branch never changes. A different insertion order only
+  // costs a cache miss, never a wrong hit. The clone workload's 50
+  // identical ls-refs calls hit one entry.
+  let cacheKey = `${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}|`;
+  for (const [name, oid] of repo.refs) cacheKey += `${name}=${oid};`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) return ok(UPLOAD_RESULT_TYPE, cached);
   const keep = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
 
@@ -156,7 +169,9 @@ export function handleLsRefs(repo: RepoRecord, body: Buffer): GitResponse {
     }
     out.push(`${line}\n`);
   }
-  const response = Buffer.concat([encodePktLines([...out, 'flush'])]);
+  const response = encodePktLines([...out, 'flush']);
+  if (repo.lsRefsCache.size >= LS_REFS_CACHE_MAX_ENTRIES) repo.lsRefsCache.clear();
+  repo.lsRefsCache.set(cacheKey, response);
   return ok(UPLOAD_RESULT_TYPE, response);
 }
 
@@ -173,8 +188,8 @@ interface FetchArgs {
   deepenNot: string[];
 }
 
-function parseFetchArgsV2(body: Buffer): FetchArgs {
-  const { lines } = parseV2Command(body, 'fetch');
+function parseFetchArgsV2(packets: readonly PktLine[]): FetchArgs {
+  const { lines } = parseV2Command(packets, 'fetch');
   const args: FetchArgs = { wants: [], haves: [], shallow: [], deepenNot: [] };
   for (const line of lines) {
     if (line.startsWith('want ')) args.wants.push(line.slice(5).trim());
@@ -192,8 +207,7 @@ function parseFetchArgsV2(body: Buffer): FetchArgs {
   return args;
 }
 
-function parseFetchArgsV0(body: Buffer): FetchArgs {
-  const { packets } = decodePktLines(body);
+function parseFetchArgsV0(packets: readonly PktLine[]): FetchArgs {
   const args: FetchArgs = { wants: [], haves: [], shallow: [], deepenNot: [] };
   let section = 0;
   for (const packet of packets) {
@@ -242,17 +256,15 @@ function buildFetchPack(repo: RepoRecord, oids: ReadonlySet<string>): Buffer {
  * and refs move, so those are resolved to their current tips first.
  */
 function fetchCacheKey(version: 'v2' | 'v0', repo: RepoRecord, args: FetchArgs): string {
-  const sorted = (values: readonly string[]): string[] => [...values].sort();
+  // Length-prefixed segments (unambiguous without JSON's object + escaping
+  // overhead); each list is sorted so the key is order-insensitive.
+  const enc = (values: readonly string[]): string => {
+    let out = '';
+    for (const value of [...values].sort()) out += `${value.length}:${value},`;
+    return out;
+  };
   const deepenNot = args.deepenNot.map((value) => (isObjectId(value) ? value : (repo.refs.get(value) ?? value)));
-  return JSON.stringify({
-    v: version,
-    w: sorted(args.wants),
-    h: sorted(args.haves),
-    s: sorted(args.shallow),
-    d: args.depth ?? null,
-    ds: args.deepenSince ?? null,
-    dn: sorted(deepenNot),
-  });
+  return `v${version}|${enc(args.wants)}|${enc(args.haves)}|${enc(args.shallow)}|${args.depth ?? ''}|${args.deepenSince ?? ''}|${enc(deepenNot)}`;
 }
 
 /** The pack cache is bounded: a full cache is dropped rather than grown. */
@@ -269,8 +281,8 @@ function cacheFetchResponse(repo: RepoRecord, key: string, body: Buffer): void {
  * always at least one packet — an empty pack is still a valid 32-byte pack).
  * A want the store does not hold is answered with a band-3 sideband error.
  */
-export function handleFetchV2(repo: RepoRecord, body: Buffer): GitResponse {
-  const args = parseFetchArgsV2(body);
+export function handleFetchV2(repo: RepoRecord, packets: readonly PktLine[]): GitResponse {
+  const args = parseFetchArgsV2(packets);
   for (const want of args.wants) {
     if (!isObjectId(want)) throw new PktLineError(`fetch wants a bad object id ${JSON.stringify(want)}`);
   }
@@ -322,8 +334,8 @@ export function handleFetchV2(repo: RepoRecord, body: Buffer): GitResponse {
  * as sideband band 1, then flush. (The suite's v0 client only ever asks for
  * advertisements, but a real v0 fetch costs nothing on top of the planner.)
  */
-export function handleFetchV0(repo: RepoRecord, body: Buffer): GitResponse {
-  const args = parseFetchArgsV0(body);
+export function handleFetchV0(repo: RepoRecord, packets: readonly PktLine[]): GitResponse {
+  const args = parseFetchArgsV0(packets);
   const cacheKey = fetchCacheKey('v0', repo, args);
   const cached = repo.packCache.get(cacheKey);
   if (cached !== undefined) return ok(UPLOAD_RESULT_TYPE, cached);
@@ -371,16 +383,18 @@ export function handleFetchV0(repo: RepoRecord, body: Buffer): GitResponse {
  */
 export function handleUploadPack(repo: RepoRecord, body: Buffer, gitProtocolVersion: 2 | 0): GitResponse {
   if (body.length === 0) throw new PktLineError('empty upload-pack request');
+  // Decode once here; the sub-handlers receive the packets (a second decode
+  // of the same body was pure waste on every clone request).
   const { packets } = decodePktLines(body);
   const first = packets.find((packet) => packet.kind === 'data');
   const command = first && first.kind === 'data' ? lineText(first.payload) : '';
-  if (command === 'command=ls-refs') return handleLsRefs(repo, body);
-  if (command === 'command=fetch') return handleFetchV2(repo, body);
+  if (command === 'command=ls-refs') return handleLsRefs(repo, packets);
+  if (command === 'command=fetch') return handleFetchV2(repo, packets);
   if (command.startsWith('command=')) throw new PktLineError(`unknown upload-pack command ${JSON.stringify(command)}`);
   // No v2 command: a v0 fetch (want lines, or garbage — the v0 parser only
   // reads want/have/shallow/deepen lines and ignores the rest).
   if (gitProtocolVersion === 2 && command !== '' && !command.startsWith('want ')) {
     throw new PktLineError(`unexpected upload-pack request ${JSON.stringify(command.slice(0, 40))}`);
   }
-  return handleFetchV0(repo, body);
+  return handleFetchV0(repo, packets);
 }

@@ -295,6 +295,32 @@ export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup
 
   const entries: PackEntry[] = [];
   const objects = new Map<string, GitObject>();
+
+  // Fast path: no deltas (the push workload's packs are always plain) —
+  // resolve each entry directly, without the delta machinery's Maps, Set,
+  // and recursive resolver closure. The result is byte-identical to the
+  // general path for a delta-free pack (same oids, same entries, delta null).
+  const hasDelta = raw.some((entry) => entry.typeCode === 6 || entry.typeCode === 7);
+  if (!hasDelta) {
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode] as GitObjectType;
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+      entries.push({ offset: entry.offset, type, size: entry.size, data: entry.data, oid, delta: null });
+    }
+    return {
+      version,
+      declaredCount,
+      objects,
+      entries,
+      trailer,
+      computedTrailer,
+      checksumOk,
+      deltaCount: 0,
+      byteLength: buffer.length,
+    };
+  }
+
   const resolving = new Set<number>();
   const resolvedByOid = new Map<string, RawEntry>();
 

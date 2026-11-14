@@ -47,7 +47,8 @@ export function objectHeader(type: GitObjectType, size: number): Buffer {
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
   const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
-  hash.update(objectHeader(type, body.length));
+  // Feed the header as a string: identical bytes, one less Buffer allocation.
+  hash.update(`${type} ${body.length}\u0000`, 'utf8');
   hash.update(body);
   return hash.digest('hex');
 }
@@ -123,6 +124,42 @@ export interface TagView {
   readonly tag: string;
   readonly tagger: string;
   readonly message: string;
+}
+
+/**
+ * A commit's parent ids, scanned straight from the raw bytes without a full
+ * parse (no header string, no split, no message decode, no `extra` array).
+ * Behavior matches `parseCommit` exactly for the fields it touches: a bad
+ * parent id or a missing/invalid tree throws the same GitObjectError with
+ * the same code. The push workload's fast-forward check walks one parent
+ * per push through this instead of a full parse.
+ */
+export function commitParents(data: Uint8Array): string[] {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const blank = buffer.indexOf('\n\n');
+  const headerEnd = blank < 0 ? buffer.length : blank;
+  const parents: string[] = [];
+  let tree = '';
+  let offset = 0;
+  while (offset < headerEnd) {
+    const nl = buffer.indexOf(0x0a, offset);
+    const lineEnd = nl < 0 || nl > headerEnd ? headerEnd : nl;
+    if (lineEnd - offset > 0) {
+      const space = buffer.indexOf(0x20, offset);
+      const keyEnd = space < 0 || space > lineEnd ? lineEnd : space;
+      const key = buffer.subarray(offset, keyEnd).toString('ascii');
+      if (key === 'parent') {
+        const value = keyEnd < lineEnd ? buffer.subarray(keyEnd + 1, lineEnd).toString('ascii') : '';
+        if (!isObjectId(value)) throw new GitObjectError('commit has a bad parent id', 'commit-parse');
+        parents.push(value);
+      } else if (key === 'tree') {
+        tree = keyEnd < lineEnd ? buffer.subarray(keyEnd + 1, lineEnd).toString('ascii') : '';
+      }
+    }
+    offset = lineEnd + 1;
+  }
+  if (!isObjectId(tree)) throw new GitObjectError('commit has no valid tree header', 'commit-parse');
+  return parents;
 }
 
 /** Parse a commit object; refuses a malformed header layout. */
@@ -343,7 +380,7 @@ export function isAncestor(ancestor: string, descendant: string, lookup: ObjectL
     seen.add(oid);
     const object = lookup(oid);
     if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    for (const parent of commitParents(object.data)) {
       if (parent === ancestor) return true;
       queue.push(parent);
     }

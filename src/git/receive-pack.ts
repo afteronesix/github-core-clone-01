@@ -2,7 +2,7 @@
 // the push exchange. Unpack FIRST, then apply refs: a refused update still
 // reports `unpack ok`, and only the fast-forward refs move.
 
-import { decodePktLines, encodePktLine, encodePktLines, encodeSideband, pktLineFlush, PktLineError, type PktLine } from './pktline.ts';
+import { decodePktLines, encodePktLines, encodeSideband, pktLineFlush, PktLineError, type PktLine } from './pktline.ts';
 import { readPack } from './pack.ts';
 import { GitObjectError, isObjectId, ZERO_OID } from './objects.ts';
 import { checkFastForward, deleteRef, headOid, isRefTarget, listRefs, peelTag, setRef } from './refs.ts';
@@ -31,11 +31,7 @@ export function advertisementReceivePack(repo: RepoRecord): GitResponse {
       if (peeled) lines.push(`${peeled} ${ref.name}^{}\n`);
     }
   }
-  const body = Buffer.concat([
-    encodePktLine('# service=git-receive-pack\n'),
-    pktLineFlush(),
-    encodePktLines([...lines, 'flush']),
-  ]);
+  const body = encodePktLines(['# service=git-receive-pack\n', 'flush', ...lines, 'flush']);
   return { status: 200, contentType: RECEIVE_ADVERTISEMENT_TYPE, body };
 }
 
@@ -61,7 +57,8 @@ function parsePush(body: Buffer): ParsedPush {
   let first = true;
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
-    let text = packet.payload.toString('utf8').replace(/\n$/, '');
+    const rawText = packet.payload.toString('utf8');
+    let text = rawText.endsWith('\n') ? rawText.slice(0, -1) : rawText;
     if (first) {
       first = false;
       const nul = text.indexOf('\u0000');
@@ -91,9 +88,8 @@ function parsePush(body: Buffer): ParsedPush {
  * pkt-line stream directly.
  */
 function frameReport(lines: readonly string[], sideband: boolean): Buffer {
-  const report = encodePktLines(lines);
-  if (!sideband) return Buffer.concat([report, pktLineFlush()]);
-  return Buffer.concat([encodeSideband(report, 1), pktLineFlush()]);
+  if (!sideband) return encodePktLines([...lines, 'flush']);
+  return Buffer.concat([encodeSideband(encodePktLines(lines), 1), pktLineFlush()]);
 }
 
 /**

@@ -79,8 +79,8 @@ export interface RepoRecord {
   readonly pulls: Map<number, PullRecord>;
   /** Issues and PRs share ONE number sequence per repo, starting at 1. */
   nextNumber: number;
-  /** Cached serialized issue JSON (the read workload's hot path); cleared on PATCH. */
-  readonly issueJsonCache: Map<number, string>;
+  /** Cached serialized issue JSON as Buffers (the read workload's hot path); cleared on PATCH. */
+  readonly issueJsonCache: Map<number, Buffer>;
   /**
    * Cached fetch responses, keyed by the resolved fetch arguments. Safe
    * without invalidation: git objects are immutable and content-addressed, a
@@ -89,6 +89,14 @@ export interface RepoRecord {
    * it). The clone workload's 50 identical depth-1 clones hit one entry.
    */
   readonly packCache: Map<string, Buffer>;
+  /**
+   * Cached ls-refs responses, keyed by the args plus the full ref set.
+   * Safe without invalidation: the key carries the ref set itself, refs
+   * always point at existing immutable objects (so peel results are fixed
+   * for a given ref set), and the default branch never changes. The clone
+   * workload's 50 identical ls-refs calls hit one entry.
+   */
+  readonly lsRefsCache: Map<string, Buffer>;
 }
 
 export class ForgeStore {
@@ -179,6 +187,7 @@ export class ForgeStore {
       nextNumber: 1,
       issueJsonCache: new Map(),
       packCache: new Map(),
+      lsRefsCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     this.creationOrder.push(repo);

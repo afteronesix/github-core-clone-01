@@ -28,7 +28,7 @@ import {
   unauthorized,
   type Reply,
 } from './src/http/server.ts';
-import { ForgeStore } from './src/store/store.ts';
+import { ForgeStore, type RepoRecord } from './src/store/store.ts';
 import { advertisementReceivePack, handleReceivePack } from './src/git/receive-pack.ts';
 import { advertisementV0, advertisementV2, handleUploadPack } from './src/git/upload-pack.ts';
 import { PktLineError } from './src/git/pktline.ts';
@@ -39,13 +39,33 @@ import { createPull, getPull, listPullFiles, listPulls, mergePull } from './src/
 import { handleGraphQL } from './src/graphql/executor.ts';
 import { handleMcp, handleMcpDelete } from './src/mcp/server.ts';
 
-/** The path + query of a request URL, or '/' when it does not parse (never a throw). */
-function urlOf(req: IncomingMessage): URL {
-  try {
-    return new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    return new URL('http://entry/');
+/**
+ * Split a request target into path + query without `new URL` (the fast path
+ * for the clean relative targets the client always sends). Dot segments,
+ * backslashes, and absolute-form targets need real URL resolution, so those
+ * fall back to `new URL` — the routing result is identical either way.
+ */
+function splitRequestTarget(req: IncomingMessage): { path: string; query: string } {
+  const raw = req.url ?? '/';
+  const qIndex = raw.indexOf('?');
+  const path = qIndex < 0 ? raw : raw.slice(0, qIndex);
+  if (
+    raw.startsWith('http://') ||
+    raw.startsWith('https://') ||
+    path.includes('\\') ||
+    path.includes('/./') ||
+    path.includes('/../') ||
+    path.endsWith('/.') ||
+    path.endsWith('/..')
+  ) {
+    try {
+      const url = new URL(raw, 'http://entry');
+      return { path: url.pathname, query: url.search.slice(1) };
+    } catch {
+      return { path: '/', query: '' };
+    }
   }
+  return { path, query: qIndex < 0 ? '' : raw.slice(qIndex + 1) };
 }
 
 /** The request's origin (scheme + host) for absolute pagination URLs. */
@@ -62,6 +82,8 @@ function gitProtocolVersion(req: IncomingMessage): 2 | 0 {
 
 /** Decode one URL path segment (or a slash-separated path, piece by piece). */
 function decodePath(value: string): string {
+  // No '%' anywhere: decodeURIComponent would return every piece unchanged.
+  if (!value.includes('%')) return value;
   return value
     .split('/')
     .map((piece) => {
@@ -72,6 +94,19 @@ function decodePath(value: string): string {
       }
     })
     .join('/');
+}
+
+/** Parse an all-digit segment as a number (`null` when it is not one). */
+function parseUint(value: string): number | null {
+  if (value.length === 0) return null;
+  let n = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 48 || code > 57) return null;
+    n = n * 10 + (code - 48);
+    if (n > Number.MAX_SAFE_INTEGER) return null;
+  }
+  return n;
 }
 
 export function createApp(): Server {
@@ -108,9 +143,12 @@ async function dispatch(
   store: ForgeStore,
   auth: ReturnType<typeof createAuthGate>,
 ): Promise<Reply> {
-  const url = urlOf(req);
-  const path = url.pathname;
+  const { path, query } = splitRequestTarget(req);
   const method = req.method ?? 'GET';
+  // Query params are parsed lazily — only the list endpoints and info/refs
+  // read them, and most hot-path requests never touch the query at all.
+  let params: URLSearchParams | null = null;
+  const searchParams = (): URLSearchParams => (params ??= new URLSearchParams(query));
 
   // The env's boot check calls this twice: 200 {"ok":true}. No auth.
   if (method === 'GET' && path === '/healthz') return jsonReply(200, { ok: true });
@@ -119,24 +157,34 @@ async function dispatch(
   if (!auth.isAuthorized(req)) throw unauthorized();
 
   // --- git smart HTTP: /:owner/:repo.git/... --------------------------------
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-  if (gitMatch) {
-    const [, owner, repoName, service] = gitMatch as unknown as [string, string, string, string];
-    const repo = store.getRepo(owner, repoName);
-    if (!repo) throw notFound('Not Found');
-    if (service === 'info/refs') {
-      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
-      const serviceParam = url.searchParams.get('service');
-      if (serviceParam === 'git-upload-pack') {
-        return gitProtocolVersion(req) === 2 ? advertisementV2() : advertisementV0(repo);
+  // Manual parse (no regex): the last '.git/' wins, owner/repo are slash-free
+  // and non-empty, the service is exactly one of the three — the same match
+  // set as the old `^/([^/]+)/([^/]+)\.git/(info/refs|...)$` regex.
+  const gitIdx = path.lastIndexOf('.git/');
+  if (gitIdx > 1) {
+    const slash1 = path.indexOf('/', 1);
+    if (slash1 > 1 && gitIdx > slash1 + 1 && path.indexOf('/', slash1 + 1) === gitIdx + 4) {
+      const service = path.slice(gitIdx + 5);
+      if (service === 'info/refs' || service === 'git-upload-pack' || service === 'git-receive-pack') {
+        const owner = path.slice(1, slash1);
+        const repoName = path.slice(slash1 + 1, gitIdx);
+        const repo = store.getRepo(owner, repoName);
+        if (!repo) throw notFound('Not Found');
+        if (service === 'info/refs') {
+          if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+          const serviceParam = searchParams().get('service');
+          if (serviceParam === 'git-upload-pack') {
+            return gitProtocolVersion(req) === 2 ? advertisementV2() : advertisementV0(repo);
+          }
+          if (serviceParam === 'git-receive-pack') return advertisementReceivePack(repo);
+          throw notFound('Not Found');
+        }
+        if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+        const body = await readBody(req);
+        if (service === 'git-upload-pack') return handleUploadPack(repo, body, gitProtocolVersion(req));
+        return handleReceivePack(repo, body);
       }
-      if (serviceParam === 'git-receive-pack') return advertisementReceivePack(repo);
-      throw notFound('Not Found');
     }
-    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-    const body = await readBody(req);
-    if (service === 'git-upload-pack') return handleUploadPack(repo, body, gitProtocolVersion(req));
-    return handleReceivePack(repo, body);
   }
 
   // --- REST v3 ---------------------------------------------------------------
@@ -154,104 +202,35 @@ async function dispatch(
   }
   if (path === '/api/v3/user/repos') {
     if (method === 'POST') return createRepo(store, parseJsonBody(await readBody(req)));
-    if (method === 'GET') return listUserRepos(store, url.searchParams, originOf(req));
+    if (method === 'GET') return listUserRepos(store, searchParams(), originOf(req));
     throw new HttpError(405, 'Method Not Allowed');
   }
-  const repoMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)$/.exec(path);
-  if (repoMatch) {
-    const [, owner, repoName] = repoMatch as unknown as [string, string, string];
-    const decodedOwner = decodePath(owner);
-    const decodedRepo = decodePath(repoName);
-    if (method === 'GET') return getRepo(store, decodedOwner, decodedRepo);
-    if (method === 'PATCH') return patchRepo(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
-    if (method === 'DELETE') return deleteRepo(store, decodedOwner, decodedRepo);
-    throw new HttpError(405, 'Method Not Allowed');
-  }
-  const repoSubMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/(.+)$/.exec(path);
-  if (repoSubMatch) {
-    const [, owner, repoName, rest] = repoSubMatch as unknown as [string, string, string, string];
-    const decodedOwner = decodePath(owner);
-    const decodedRepo = decodePath(repoName);
-    const repo = store.getRepo(decodedOwner, decodedRepo);
-    if (!repo) throw notFound('Not Found');
-    if (rest === 'branches') {
-      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
-      return listBranches(store, decodedOwner, decodedRepo);
-    }
-    if (rest.startsWith('branches/')) {
-      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
-      return getBranch(store, decodedOwner, decodedRepo, decodePath(rest.slice('branches/'.length)));
-    }
-    if (rest === 'commits') {
-      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
-      return listCommits(store, decodedOwner, decodedRepo, url.searchParams);
-    }
-    if (rest === 'git/refs') {
-      if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-      return createGitRef(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
-    }
-    if (rest.startsWith('git/refs/')) {
-      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
-      return getGitRef(store, decodedOwner, decodedRepo, decodePath(rest.slice('git/refs/'.length)));
-    }
-    if (rest === 'contents' || rest.startsWith('contents/')) {
-      const filePath = rest === 'contents' ? '' : decodePath(rest.slice('contents/'.length));
-      if (method === 'GET') return getContents(repo, filePath, url.searchParams);
-      if (method === 'PUT') return putContents(store, repo, filePath, parseJsonBody(await readBody(req)));
-      if (method === 'DELETE') return deleteContents(store, repo, filePath, parseJsonBody(await readBody(req)));
-      throw new HttpError(405, 'Method Not Allowed');
-    }
-    if (rest === 'labels') {
-      if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-      return createLabel(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
-    }
-    if (rest === 'issues') {
-      if (method === 'GET') return listIssues(store, decodedOwner, decodedRepo, url.searchParams, originOf(req));
-      if (method === 'POST') return createIssue(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
-      throw new HttpError(405, 'Method Not Allowed');
-    }
-    const issueMatch = /^issues\/(\d+)$/.exec(rest);
-    if (issueMatch) {
-      const number = Number(issueMatch[1]);
-      if (method === 'GET') return getIssue(store, decodedOwner, decodedRepo, number);
-      if (method === 'PATCH') {
-        return patchIssue(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
+  // Manual parse (no regex): /api/v3/repos/{owner}/{repo} or /{owner}/{repo}/{rest...}.
+  // Owner/repo are slash-free and non-empty; rest is 1+ chars — the same match
+  // set as the old repoMatch/repoSubMatch regexes.
+  if (path.startsWith('/api/v3/repos/')) {
+    const afterPrefix = path.slice('/api/v3/repos/'.length);
+    const slashA = afterPrefix.indexOf('/');
+    if (slashA > 0) {
+      const decodedOwner = decodePath(afterPrefix.slice(0, slashA));
+      const afterOwner = afterPrefix.slice(slashA + 1);
+      const slashB = afterOwner.indexOf('/');
+      if (slashB < 0) {
+        if (afterOwner.length > 0) {
+          const decodedRepo = decodePath(afterOwner);
+          if (method === 'GET') return getRepo(store, decodedOwner, decodedRepo);
+          if (method === 'PATCH') return patchRepo(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
+          if (method === 'DELETE') return deleteRepo(store, decodedOwner, decodedRepo);
+          throw new HttpError(405, 'Method Not Allowed');
+        }
+      } else if (slashB > 0 && afterOwner.length > slashB + 1) {
+        const decodedRepo = decodePath(afterOwner.slice(0, slashB));
+        const rest = afterOwner.slice(slashB + 1);
+        const repo = store.getRepo(decodedOwner, decodedRepo);
+        if (!repo) throw notFound('Not Found');
+        return dispatchRepoSub(req, store, method, decodedOwner, decodedRepo, repo, rest, searchParams(), originOf(req));
       }
-      throw new HttpError(405, 'Method Not Allowed');
     }
-    const commentsMatch = /^issues\/(\d+)\/comments$/.exec(rest);
-    if (commentsMatch) {
-      const number = Number(commentsMatch[1]);
-      if (method === 'GET') return listComments(store, decodedOwner, decodedRepo, number);
-      if (method === 'POST') {
-        return createComment(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
-      }
-      throw new HttpError(405, 'Method Not Allowed');
-    }
-    if (rest === 'pulls') {
-      if (method === 'GET') return listPulls(store, decodedOwner, decodedRepo, url.searchParams, originOf(req));
-      if (method === 'POST') return createPull(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
-      throw new HttpError(405, 'Method Not Allowed');
-    }
-    const pullMatch = /^pulls\/(\d+)$/.exec(rest);
-    if (pullMatch) {
-      const number = Number(pullMatch[1]);
-      if (method === 'GET') return getPull(store, decodedOwner, decodedRepo, number);
-      throw new HttpError(405, 'Method Not Allowed');
-    }
-    const pullFilesMatch = /^pulls\/(\d+)\/files$/.exec(rest);
-    if (pullFilesMatch) {
-      const number = Number(pullFilesMatch[1]);
-      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
-      return listPullFiles(store, decodedOwner, decodedRepo, number);
-    }
-    const pullMergeMatch = /^pulls\/(\d+)\/merge$/.exec(rest);
-    if (pullMergeMatch) {
-      const number = Number(pullMergeMatch[1]);
-      if (method !== 'PUT') throw new HttpError(405, 'Method Not Allowed');
-      return mergePull(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
-    }
-    throw notFound('Not Found');
   }
 
   // --- GraphQL v4 ------------------------------------------------------------
@@ -270,5 +249,99 @@ async function dispatch(
   }
 
   // Everything else, every method: GitHub's 404 body.
+  throw notFound('Not Found');
+}
+
+/**
+ * Dispatch /api/v3/repos/{owner}/{repo}/{rest...}; the repo is known to exist.
+ * The numeric sub-routes parse `rest` once (split + digit check) instead of
+ * running a regex per route — same match set, same 404/405 outcomes.
+ */
+async function dispatchRepoSub(
+  req: IncomingMessage,
+  store: ForgeStore,
+  method: string,
+  owner: string,
+  repoName: string,
+  repo: RepoRecord,
+  rest: string,
+  searchParams: URLSearchParams,
+  origin: string,
+): Promise<Reply> {
+  if (rest === 'branches') {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return listBranches(store, owner, repoName);
+  }
+  if (rest.startsWith('branches/')) {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return getBranch(store, owner, repoName, decodePath(rest.slice('branches/'.length)));
+  }
+  if (rest === 'commits') {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return listCommits(store, owner, repoName, searchParams);
+  }
+  if (rest === 'git/refs') {
+    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+    return createGitRef(store, owner, repoName, parseJsonBody(await readBody(req)));
+  }
+  if (rest.startsWith('git/refs/')) {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return getGitRef(store, owner, repoName, decodePath(rest.slice('git/refs/'.length)));
+  }
+  if (rest === 'contents' || rest.startsWith('contents/')) {
+    const filePath = rest === 'contents' ? '' : decodePath(rest.slice('contents/'.length));
+    if (method === 'GET') return getContents(repo, filePath, searchParams);
+    if (method === 'PUT') return putContents(store, repo, filePath, parseJsonBody(await readBody(req)));
+    if (method === 'DELETE') return deleteContents(store, repo, filePath, parseJsonBody(await readBody(req)));
+    throw new HttpError(405, 'Method Not Allowed');
+  }
+  if (rest === 'labels') {
+    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+    return createLabel(store, owner, repoName, parseJsonBody(await readBody(req)));
+  }
+  if (rest === 'issues') {
+    if (method === 'GET') return listIssues(store, owner, repoName, searchParams, origin);
+    if (method === 'POST') return createIssue(store, owner, repoName, parseJsonBody(await readBody(req)));
+    throw new HttpError(405, 'Method Not Allowed');
+  }
+  if (rest === 'pulls') {
+    if (method === 'GET') return listPulls(store, owner, repoName, searchParams, origin);
+    if (method === 'POST') return createPull(store, owner, repoName, parseJsonBody(await readBody(req)));
+    throw new HttpError(405, 'Method Not Allowed');
+  }
+  // Numeric sub-routes: issues/N, issues/N/comments, pulls/N, pulls/N/files,
+  // pulls/N/merge. One split + one digit check replaces five regexes.
+  const parts = rest.split('/');
+  if (parts.length === 2 || parts.length === 3) {
+    const number = parseUint(parts[1] as string);
+    if (number !== null) {
+      if (parts[0] === 'issues' && parts.length === 2) {
+        if (method === 'GET') return getIssue(store, owner, repoName, number);
+        if (method === 'PATCH') {
+          return patchIssue(store, owner, repoName, number, parseJsonBody(await readBody(req)));
+        }
+        throw new HttpError(405, 'Method Not Allowed');
+      }
+      if (parts[0] === 'issues' && parts.length === 3 && parts[2] === 'comments') {
+        if (method === 'GET') return listComments(store, owner, repoName, number);
+        if (method === 'POST') {
+          return createComment(store, owner, repoName, number, parseJsonBody(await readBody(req)));
+        }
+        throw new HttpError(405, 'Method Not Allowed');
+      }
+      if (parts[0] === 'pulls' && parts.length === 2) {
+        if (method === 'GET') return getPull(store, owner, repoName, number);
+        throw new HttpError(405, 'Method Not Allowed');
+      }
+      if (parts[0] === 'pulls' && parts.length === 3 && parts[2] === 'files') {
+        if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+        return listPullFiles(store, owner, repoName, number);
+      }
+      if (parts[0] === 'pulls' && parts.length === 3 && parts[2] === 'merge') {
+        if (method !== 'PUT') throw new HttpError(405, 'Method Not Allowed');
+        return mergePull(store, owner, repoName, number, parseJsonBody(await readBody(req)));
+      }
+    }
+  }
   throw notFound('Not Found');
 }
