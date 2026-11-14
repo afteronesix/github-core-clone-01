@@ -34,6 +34,7 @@ import { advertisementV0, advertisementV2, handleUploadPack } from './src/git/up
 import { PktLineError } from './src/git/pktline.ts';
 import { createRepo, createGitRef, deleteRepo, getBranch, getGitRef, getMeta, getRepo, getRoot, getUser, listBranches, listCommits, listUserRepos, patchRepo } from './src/rest/repos.ts';
 import { deleteContents, getContents, putContents } from './src/rest/contents.ts';
+import { createComment, createIssue, createLabel, getIssue, listComments, listIssues, patchIssue } from './src/rest/issues.ts';
 
 /** The path + query of a request URL, or '/' when it does not parse (never a throw). */
 function urlOf(req: IncomingMessage): URL {
@@ -195,6 +196,33 @@ async function dispatch(
       if (method === 'GET') return getContents(repo, filePath, url.searchParams);
       if (method === 'PUT') return putContents(store, repo, filePath, parseJsonBody(await readBody(req)));
       if (method === 'DELETE') return deleteContents(store, repo, filePath, parseJsonBody(await readBody(req)));
+      throw new HttpError(405, 'Method Not Allowed');
+    }
+    if (rest === 'labels') {
+      if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+      return createLabel(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
+    }
+    if (rest === 'issues') {
+      if (method === 'GET') return listIssues(store, decodedOwner, decodedRepo, url.searchParams, originOf(req));
+      if (method === 'POST') return createIssue(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
+      throw new HttpError(405, 'Method Not Allowed');
+    }
+    const issueMatch = /^issues\/(\d+)$/.exec(rest);
+    if (issueMatch) {
+      const number = Number(issueMatch[1]);
+      if (method === 'GET') return getIssue(store, decodedOwner, decodedRepo, number);
+      if (method === 'PATCH') {
+        return patchIssue(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
+      }
+      throw new HttpError(405, 'Method Not Allowed');
+    }
+    const commentsMatch = /^issues\/(\d+)\/comments$/.exec(rest);
+    if (commentsMatch) {
+      const number = Number(commentsMatch[1]);
+      if (method === 'GET') return listComments(store, decodedOwner, decodedRepo, number);
+      if (method === 'POST') {
+        return createComment(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
+      }
       throw new HttpError(405, 'Method Not Allowed');
     }
     throw notFound('Not Found');
