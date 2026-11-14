@@ -1,7 +1,7 @@
 // REST v3 issues: labels, issues, comments. Issues and PRs share one number
 // sequence per repo (the store's nextNumber), starting at 1.
 
-import type { ForgeStore, IssueRecord, RepoRecord } from '../store/store.ts';
+import type { CommentRecord, ForgeStore, IssueRecord, RepoRecord } from '../store/store.ts';
 import { isJsonObject, jsonReply, notFound, unprocessable, type Reply } from '../http/server.ts';
 import { buildLinkHeader, paginate, parsePageParams } from './pagination.ts';
 import { requireRepo } from './repos.ts';
@@ -54,23 +54,21 @@ function resolveLabelNames(repo: RepoRecord, body: Record<string, unknown>): str
   return names;
 }
 
-/** POST /api/v3/repos/{o}/{r}/issues — create an open issue. 201. */
-export function createIssue(store: ForgeStore, owner: string, name: string, body: unknown): Reply {
-  const repo = requireRepo(store, owner, name);
-  if (!isJsonObject(body)) throw unprocessable('Validation Failed: body must be an object');
-  if (typeof body.title !== 'string' || body.title === '') {
-    throw unprocessable('Validation Failed: title is required');
-  }
-  const labels = resolveLabelNames(repo, body);
+/** Insert an issue record into the repo (shared by REST and GraphQL). */
+export function insertIssue(
+  store: ForgeStore,
+  repo: RepoRecord,
+  input: { title: string; body?: string; labels?: string[] },
+): IssueRecord {
   const stamp = store.now();
   const seq = store.nextSequence();
   const issue: IssueRecord = {
     id: store.nextIssueRecordId(),
     number: repo.nextNumber++,
-    title: body.title,
-    body: typeof body.body === 'string' ? body.body : '',
+    title: input.title,
+    body: input.body ?? '',
     state: 'open',
-    labels,
+    labels: input.labels ?? [],
     comments: [],
     createdSeq: seq,
     updatedSeq: seq,
@@ -79,6 +77,38 @@ export function createIssue(store: ForgeStore, owner: string, name: string, body
     closedAt: null,
   };
   repo.issues.set(issue.number, issue);
+  return issue;
+}
+
+/** Close an issue record (shared by REST and GraphQL). */
+export function closeIssueRecord(store: ForgeStore, repo: RepoRecord, issue: IssueRecord): void {
+  issue.state = 'closed';
+  issue.closedAt = store.now().iso;
+  issue.updatedSeq = store.nextSequence();
+  issue.updatedAt = store.now().iso;
+  repo.issueJsonCache.delete(issue.number);
+}
+
+/** Insert a comment record on an issue (shared by REST and GraphQL). */
+export function insertComment(store: ForgeStore, issue: IssueRecord, body: string): CommentRecord {
+  const comment: CommentRecord = { id: store.nextCommentRecordId(), body, createdAt: store.now().iso };
+  issue.comments.push(comment);
+  return comment;
+}
+
+/** POST /api/v3/repos/{o}/{r}/issues — create an open issue. 201. */
+export function createIssue(store: ForgeStore, owner: string, name: string, body: unknown): Reply {
+  const repo = requireRepo(store, owner, name);
+  if (!isJsonObject(body)) throw unprocessable('Validation Failed: body must be an object');
+  if (typeof body.title !== 'string' || body.title === '') {
+    throw unprocessable('Validation Failed: title is required');
+  }
+  const labels = resolveLabelNames(repo, body);
+  const issue = insertIssue(store, repo, {
+    title: body.title,
+    body: typeof body.body === 'string' ? body.body : '',
+    labels,
+  });
   return jsonReply(201, issueView(store, repo, issue));
 }
 
@@ -148,8 +178,7 @@ export function createComment(store: ForgeStore, owner: string, name: string, nu
   if (typeof body.body !== 'string' || body.body === '') {
     throw unprocessable('Validation Failed: body is required');
   }
-  const comment = { id: store.nextCommentRecordId(), body: body.body, createdAt: store.now().iso };
-  issue.comments.push(comment);
+  const comment = insertComment(store, issue, body.body);
   return jsonReply(201, {
     id: comment.id,
     body: comment.body,

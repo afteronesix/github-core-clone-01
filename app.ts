@@ -36,6 +36,7 @@ import { createRepo, createGitRef, deleteRepo, getBranch, getGitRef, getMeta, ge
 import { deleteContents, getContents, putContents } from './src/rest/contents.ts';
 import { createComment, createIssue, createLabel, getIssue, listComments, listIssues, patchIssue } from './src/rest/issues.ts';
 import { createPull, getPull, listPullFiles, listPulls, mergePull } from './src/rest/pulls.ts';
+import { handleGraphQL } from './src/graphql/executor.ts';
 
 /** The path + query of a request URL, or '/' when it does not parse (never a throw). */
 function urlOf(req: IncomingMessage): URL {
@@ -252,8 +253,14 @@ async function dispatch(
     throw notFound('Not Found');
   }
 
-  // --- GraphQL v4 / MCP: later phases; unknown until then --------------------
-  if (path === '/api/graphql' || path === '/mcp') {
+  // --- GraphQL v4 ------------------------------------------------------------
+  if (path === '/api/graphql') {
+    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+    return handleGraphQL(store, parseJsonBody(await readBody(req)));
+  }
+
+  // --- MCP: Phase 7; unknown until then --------------------------------------
+  if (path === '/mcp') {
     // Read (and discard) the body so the connection stays clean, then 404.
     await readBody(req).catch(() => Buffer.alloc(0));
     throw notFound('Not Found');

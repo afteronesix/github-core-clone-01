@@ -29,23 +29,24 @@ export function pullView(store: ForgeStore, repo: RepoRecord, pull: PullRecord):
   };
 }
 
-/** POST /api/v3/repos/{o}/{r}/pulls — open a PR. 201; unknown head/base or a duplicate open PR is 422. */
-export function createPull(store: ForgeStore, owner: string, name: string, body: unknown): Reply {
-  const repo = requireRepo(store, owner, name);
-  if (!isJsonObject(body)) throw unprocessable('Validation Failed: body must be an object');
-  if (typeof body.title !== 'string' || body.title === '') {
-    throw unprocessable('Validation Failed: title is required');
-  }
-  const head = typeof body.head === 'string' ? body.head : '';
-  const base = typeof body.base === 'string' ? body.base : repo.defaultBranch;
-  if (head === '') throw unprocessable('Validation Failed: head is required');
-  const headSha = branchTip(repo, head);
-  if (!headSha) throw unprocessable(`Validation Failed: head branch ${JSON.stringify(head)} does not exist`);
-  const baseSha = branchTip(repo, base);
-  if (!baseSha) throw unprocessable(`Validation Failed: base branch ${JSON.stringify(base)} does not exist`);
+/**
+ * Insert a pull request record (shared by REST and GraphQL). Freezes the
+ * head/base shas at creation. Throws 422 on an unknown head/base branch or
+ * a duplicate open PR for the same head+base.
+ */
+export function insertPull(
+  store: ForgeStore,
+  repo: RepoRecord,
+  input: { title: string; body?: string; head: string; base: string },
+): PullRecord {
+  if (input.head === '') throw unprocessable('Validation Failed: head is required');
+  const headSha = branchTip(repo, input.head);
+  if (!headSha) throw unprocessable(`Validation Failed: head branch ${JSON.stringify(input.head)} does not exist`);
+  const baseSha = branchTip(repo, input.base);
+  if (!baseSha) throw unprocessable(`Validation Failed: base branch ${JSON.stringify(input.base)} does not exist`);
   for (const existing of repo.pulls.values()) {
-    if (existing.state === 'open' && existing.headRef === head && existing.baseRef === base) {
-      throw unprocessable(`Validation Failed: an open pull request already exists for ${head} into ${base}`);
+    if (existing.state === 'open' && existing.headRef === input.head && existing.baseRef === input.base) {
+      throw unprocessable(`Validation Failed: an open pull request already exists for ${input.head} into ${input.base}`);
     }
   }
   const stamp = store.now();
@@ -53,12 +54,12 @@ export function createPull(store: ForgeStore, owner: string, name: string, body:
   const pull: PullRecord = {
     id: store.nextIssueRecordId(),
     number: repo.nextNumber++,
-    title: body.title,
-    body: typeof body.body === 'string' ? body.body : '',
+    title: input.title,
+    body: input.body ?? '',
     state: 'open',
-    headRef: head,
+    headRef: input.head,
     headSha,
-    baseRef: base,
+    baseRef: input.base,
     baseSha,
     merged: false,
     mergedAt: null,
@@ -69,6 +70,57 @@ export function createPull(store: ForgeStore, owner: string, name: string, body:
     updatedAt: stamp.iso,
   };
   repo.pulls.set(pull.number, pull);
+  return pull;
+}
+
+/**
+ * Squash-merge a pull request onto the CURRENT base tip (shared by REST and
+ * GraphQL). Returns the merge commit sha. Throws 405 when already merged or
+ * closed, or when the merge conflicts.
+ */
+export function squashMergePull(store: ForgeStore, repo: RepoRecord, pull: PullRecord): string {
+  if (pull.merged || pull.state !== 'open') {
+    throw methodNotAllowed('Pull request is already merged or closed');
+  }
+  const baseTip = branchTip(repo, pull.baseRef);
+  if (!baseTip) throw unprocessable(`Validation Failed: base branch ${JSON.stringify(pull.baseRef)} does not exist`);
+  const base = mergeBase(repo, baseTip, pull.headSha);
+  if (!base) throw methodNotAllowed('Pull request has no merge base');
+  if (hasMergeConflict(repo, baseTip, pull.headSha, base)) {
+    throw methodNotAllowed('Merge conflict: the pull request cannot be merged cleanly');
+  }
+  const tree = squashMergeTree(repo, baseTip, pull.headSha, base);
+  const mergeSha = createCommitObject(store, repo, {
+    tree,
+    parents: [baseTip],
+    message: `Merge pull request #${pull.number} from ${pull.headRef}`,
+  });
+  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  const stamp = store.now();
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.mergedAt = stamp.iso;
+  pull.mergeCommitSha = mergeSha;
+  pull.updatedSeq = store.nextSequence();
+  pull.updatedAt = stamp.iso;
+  return mergeSha;
+}
+
+/** POST /api/v3/repos/{o}/{r}/pulls — open a PR. 201; unknown head/base or a duplicate open PR is 422. */
+export function createPull(store: ForgeStore, owner: string, name: string, body: unknown): Reply {
+  const repo = requireRepo(store, owner, name);
+  if (!isJsonObject(body)) throw unprocessable('Validation Failed: body must be an object');
+  if (typeof body.title !== 'string' || body.title === '') {
+    throw unprocessable('Validation Failed: title is required');
+  }
+  const head = typeof body.head === 'string' ? body.head : '';
+  const base = typeof body.base === 'string' ? body.base : repo.defaultBranch;
+  const pull = insertPull(store, repo, {
+    title: body.title,
+    body: typeof body.body === 'string' ? body.body : '',
+    head,
+    base,
+  });
   return jsonReply(201, pullView(store, repo, pull));
 }
 
@@ -129,29 +181,6 @@ export function mergePull(store: ForgeStore, owner: string, name: string, number
   const repo = requireRepo(store, owner, name);
   const pull = repo.pulls.get(number);
   if (!pull) throw notFound('Not Found');
-  if (pull.merged || pull.state !== 'open') {
-    throw methodNotAllowed('Pull request is already merged or closed');
-  }
-  const baseTip = branchTip(repo, pull.baseRef);
-  if (!baseTip) throw unprocessable(`Validation Failed: base branch ${JSON.stringify(pull.baseRef)} does not exist`);
-  const base = mergeBase(repo, baseTip, pull.headSha);
-  if (!base) throw methodNotAllowed('Pull request has no merge base');
-  if (hasMergeConflict(repo, baseTip, pull.headSha, base)) {
-    throw methodNotAllowed('Merge conflict: the pull request cannot be merged cleanly');
-  }
-  const tree = squashMergeTree(repo, baseTip, pull.headSha, base);
-  const mergeSha = createCommitObject(store, repo, {
-    tree,
-    parents: [baseTip],
-    message: `Merge pull request #${pull.number} from ${pull.headRef}`,
-  });
-  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
-  const stamp = store.now();
-  pull.state = 'closed';
-  pull.merged = true;
-  pull.mergedAt = stamp.iso;
-  pull.mergeCommitSha = mergeSha;
-  pull.updatedSeq = store.nextSequence();
-  pull.updatedAt = stamp.iso;
+  const mergeSha = squashMergePull(store, repo, pull);
   return jsonReply(200, { sha: mergeSha, merged: true, message: 'Pull Request successfully merged' });
 }
