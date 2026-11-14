@@ -1,49 +1,159 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// The forge's HTTP surface: one server, four protocols over one store.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// Routing:
+//   GET  /healthz                                  (no auth — the env's boot check)
+//   GET  /:owner/:repo.git/info/refs?service=...   git advertisements (v0/v2)
+//   POST /:owner/:repo.git/git-upload-pack         ls-refs / fetch (v2 + v0)
+//   POST /:owner/:repo.git/git-receive-pack        push
+//   /api/v3/*                                      REST v3 (repos, issues, pulls, ...)
+//   POST /api/graphql                             GraphQL v4
+//   POST /mcp                                     MCP (JSON-RPC over Streamable HTTP)
+//
+// Auth: every route except /healthz requires `Authorization: Bearer
+// $MAKEFUN_SHOP_TOKEN` (auth first, then routing — an unauthenticated unknown
+// route is a 401). When the token is unset, auth is disabled. Every reply
+// carries a non-empty X-GitHub-Request-Id. A handler throw answers 500 JSON
+// and never kills the process.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createAuthGate } from './src/http/auth.ts';
+import {
+  errorReply,
+  HttpError,
+  jsonReply,
+  notFound,
+  parseJsonBody,
+  readBody,
+  sendReply,
+  unauthorized,
+  type Reply,
+} from './src/http/server.ts';
+import { ForgeStore } from './src/store/store.ts';
+import { advertisementReceivePack, handleReceivePack } from './src/git/receive-pack.ts';
+import { advertisementV0, advertisementV2, handleUploadPack } from './src/git/upload-pack.ts';
+import { PktLineError } from './src/git/pktline.ts';
+import { createRepo, deleteRepo, getMeta, getRepo, getRoot, getUser, listUserRepos, patchRepo } from './src/rest/repos.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+/** The path + query of a request URL, or '/' when it does not parse (never a throw). */
+function urlOf(req: IncomingMessage): URL {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return '/';
+    return new URL('http://entry/');
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/** The request's origin (scheme + host) for absolute pagination URLs. */
+function originOf(req: IncomingMessage): string {
+  const host = req.headers.host ?? 'entry';
+  return `http://${host}`;
+}
+
+/** `version=2` in the Git-Protocol header selects protocol v2; anything else is v0. */
+function gitProtocolVersion(req: IncomingMessage): 2 | 0 {
+  const header = req.headers['git-protocol'];
+  return header === 'version=2' ? 2 : 0;
+}
+
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+  const store = new ForgeStore();
+  const auth = createAuthGate(process.env.MAKEFUN_SHOP_TOKEN);
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
+  const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const requestId = store.nextRequest();
+    try {
+      const reply = await dispatch(req, store, auth);
+      sendReply(res, reply, requestId);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        sendReply(res, errorReply(err.status, err.message), requestId);
+        return;
+      }
+      if (err instanceof PktLineError) {
+        sendReply(res, errorReply(400, err.message), requestId);
+        return;
+      }
+      // A handler throw must answer 500 JSON, never kill the process.
+      process.stderr.write(`[forge] unhandled error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+      sendReply(res, errorReply(500, 'Internal Server Error'), requestId);
     }
+  };
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+  return createServer((req, res) => {
+    void handler(req, res);
   });
+}
+
+async function dispatch(
+  req: IncomingMessage,
+  store: ForgeStore,
+  auth: ReturnType<typeof createAuthGate>,
+): Promise<Reply> {
+  const url = urlOf(req);
+  const path = url.pathname;
+  const method = req.method ?? 'GET';
+
+  // The env's boot check calls this twice: 200 {"ok":true}. No auth.
+  if (method === 'GET' && path === '/healthz') return jsonReply(200, { ok: true });
+
+  // Auth first, then routing.
+  if (!auth.isAuthorized(req)) throw unauthorized();
+
+  // --- git smart HTTP: /:owner/:repo.git/... --------------------------------
+  const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+  if (gitMatch) {
+    const [, owner, repoName, service] = gitMatch as unknown as [string, string, string, string];
+    const repo = store.getRepo(owner, repoName);
+    if (!repo) throw notFound('Not Found');
+    if (service === 'info/refs') {
+      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+      const serviceParam = url.searchParams.get('service');
+      if (serviceParam === 'git-upload-pack') {
+        return gitProtocolVersion(req) === 2 ? advertisementV2() : advertisementV0(repo);
+      }
+      if (serviceParam === 'git-receive-pack') return advertisementReceivePack(repo);
+      throw notFound('Not Found');
+    }
+    if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
+    const body = await readBody(req);
+    if (service === 'git-upload-pack') return handleUploadPack(repo, body, gitProtocolVersion(req));
+    return handleReceivePack(repo, body);
+  }
+
+  // --- REST v3 ---------------------------------------------------------------
+  if (path === '/api/v3' || path === '/api/v3/') {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return getRoot();
+  }
+  if (path === '/api/v3/meta') {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return getMeta();
+  }
+  if (path === '/api/v3/user') {
+    if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+    return getUser(store);
+  }
+  if (path === '/api/v3/user/repos') {
+    if (method === 'POST') return createRepo(store, parseJsonBody(await readBody(req)));
+    if (method === 'GET') return listUserRepos(store, url.searchParams, originOf(req));
+    throw new HttpError(405, 'Method Not Allowed');
+  }
+  const repoMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)$/.exec(path);
+  if (repoMatch) {
+    const [, owner, repoName] = repoMatch as unknown as [string, string, string];
+    if (method === 'GET') return getRepo(store, owner, repoName);
+    if (method === 'PATCH') return patchRepo(store, owner, repoName, parseJsonBody(await readBody(req)));
+    if (method === 'DELETE') return deleteRepo(store, owner, repoName);
+    throw new HttpError(405, 'Method Not Allowed');
+  }
+
+  // --- GraphQL v4 / MCP: later phases; unknown until then --------------------
+  if (path === '/api/graphql' || path === '/mcp') {
+    // Read (and discard) the body so the connection stays clean, then 404.
+    await readBody(req).catch(() => Buffer.alloc(0));
+    throw notFound('Not Found');
+  }
+
+  // Everything else, every method: GitHub's 404 body.
+  throw notFound('Not Found');
 }

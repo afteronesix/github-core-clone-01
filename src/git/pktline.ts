@@ -121,10 +121,11 @@ export function packetsToLines(packets: readonly PktLine[]): string[] {
 }
 
 /**
- * Frame `data` as sideband packets on `band` (1 = data, 2 = progress), each payload
- * chunked to SIDEBAND_CHUNK bytes plus the 1 band byte. Returns the pkt-line stream.
+ * Frame `data` as sideband packets on `band` (1 = data, 2 = progress, 3 = error),
+ * each payload chunked to SIDEBAND_CHUNK bytes plus the 1 band byte.
+ * Returns the pkt-line stream.
  */
-export function encodeSideband(data: Buffer, band: 1 | 2): Buffer {
+export function encodeSideband(data: Buffer, band: 1 | 2 | 3): Buffer {
   const parts: Buffer[] = [];
   for (let offset = 0; offset < data.length; offset += SIDEBAND_CHUNK) {
     const chunk = data.subarray(offset, Math.min(data.length, offset + SIDEBAND_CHUNK));
