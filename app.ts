@@ -35,6 +35,7 @@ import { PktLineError } from './src/git/pktline.ts';
 import { createRepo, createGitRef, deleteRepo, getBranch, getGitRef, getMeta, getRepo, getRoot, getUser, listBranches, listCommits, listUserRepos, patchRepo } from './src/rest/repos.ts';
 import { deleteContents, getContents, putContents } from './src/rest/contents.ts';
 import { createComment, createIssue, createLabel, getIssue, listComments, listIssues, patchIssue } from './src/rest/issues.ts';
+import { createPull, getPull, listPullFiles, listPulls, mergePull } from './src/rest/pulls.ts';
 
 /** The path + query of a request URL, or '/' when it does not parse (never a throw). */
 function urlOf(req: IncomingMessage): URL {
@@ -224,6 +225,29 @@ async function dispatch(
         return createComment(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
       }
       throw new HttpError(405, 'Method Not Allowed');
+    }
+    if (rest === 'pulls') {
+      if (method === 'GET') return listPulls(store, decodedOwner, decodedRepo, url.searchParams, originOf(req));
+      if (method === 'POST') return createPull(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
+      throw new HttpError(405, 'Method Not Allowed');
+    }
+    const pullMatch = /^pulls\/(\d+)$/.exec(rest);
+    if (pullMatch) {
+      const number = Number(pullMatch[1]);
+      if (method === 'GET') return getPull(store, decodedOwner, decodedRepo, number);
+      throw new HttpError(405, 'Method Not Allowed');
+    }
+    const pullFilesMatch = /^pulls\/(\d+)\/files$/.exec(rest);
+    if (pullFilesMatch) {
+      const number = Number(pullFilesMatch[1]);
+      if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
+      return listPullFiles(store, decodedOwner, decodedRepo, number);
+    }
+    const pullMergeMatch = /^pulls\/(\d+)\/merge$/.exec(rest);
+    if (pullMergeMatch) {
+      const number = Number(pullMergeMatch[1]);
+      if (method !== 'PUT') throw new HttpError(405, 'Method Not Allowed');
+      return mergePull(store, decodedOwner, decodedRepo, number, parseJsonBody(await readBody(req)));
     }
     throw notFound('Not Found');
   }
