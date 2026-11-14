@@ -3,6 +3,9 @@
 // this file owns the repo object shape every surface returns.)
 
 import type { ForgeStore, RepoRecord } from '../store/store.ts';
+import { isObjectId } from '../git/objects.ts';
+import { listBranches as listBranchesOf, resolveRefOrSha } from '../git/refs.ts';
+import { commitView, listCommitOids } from '../git/commits.ts';
 import { emptyReply, errorReply, isJsonObject, jsonReply, notFound, unprocessable, type Reply } from '../http/server.ts';
 import { buildLinkHeader, paginate, parsePageParams } from './pagination.ts';
 
@@ -111,4 +114,84 @@ export function deleteRepo(store: ForgeStore, owner: string, name: string): Repl
   const deleted = store.deleteRepo(owner, name);
   if (!deleted) throw notFound('Not Found');
   return emptyReply(204);
+}
+
+// ---------------------------------------------------------------------------------------------
+// branches, commits, git/refs
+// ---------------------------------------------------------------------------------------------
+
+/** GET /api/v3/repos/{o}/{r}/branches — every branch with its tip sha, sorted by name. */
+export function listBranches(store: ForgeStore, owner: string, name: string): Reply {
+  const repo = requireRepo(store, owner, name);
+  const branches = listBranchesOf(repo).map((branch) => ({
+    name: branch,
+    commit: { sha: repo.refs.get(`refs/heads/${branch}`) as string },
+  }));
+  return jsonReply(200, branches);
+}
+
+/** GET /api/v3/repos/{o}/{r}/branches/{branch} — one branch, 404 when absent. */
+export function getBranch(store: ForgeStore, owner: string, name: string, branch: string): Reply {
+  const repo = requireRepo(store, owner, name);
+  const tip = repo.refs.get(`refs/heads/${branch}`);
+  if (!tip) throw notFound('Not Found');
+  return jsonReply(200, { name: branch, commit: { sha: tip } });
+}
+
+/**
+ * GET /api/v3/repos/{o}/{r}/commits?sha=<ref> — the history newest-first,
+ * walking parents from the ref tip (a branch name, a full ref, or a commit
+ * sha; default: the default branch tip). An unborn repo answers [].
+ */
+export function listCommits(store: ForgeStore, owner: string, name: string, query: URLSearchParams): Reply {
+  const repo = requireRepo(store, owner, name);
+  const shaParam = query.get('sha');
+  const tip = shaParam
+    ? resolveRefOrSha(repo, shaParam)
+    : (repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? undefined);
+  if (!tip) return jsonReply(200, []);
+  const params = parsePageParams(query);
+  const oids = listCommitOids(repo, tip);
+  const page = paginate(oids, params);
+  const views: Record<string, unknown>[] = [];
+  for (const oid of page.items) {
+    const view = commitView(repo, oid);
+    if (view) views.push(view);
+  }
+  return jsonReply(200, views);
+}
+
+/**
+ * POST /api/v3/repos/{o}/{r}/git/refs — create a ref at a commit sha.
+ * 201 `{ref, object: {sha}}`; 422 when the ref exists or the sha is unknown.
+ */
+export function createGitRef(store: ForgeStore, owner: string, name: string, body: unknown): Reply {
+  const repo = requireRepo(store, owner, name);
+  if (!isJsonObject(body)) throw unprocessable('Validation Failed: body must be an object');
+  const ref = body.ref;
+  const sha = body.sha;
+  if (typeof ref !== 'string' || !ref.startsWith('refs/')) {
+    throw unprocessable('Validation Failed: ref must start with refs/');
+  }
+  if (typeof sha !== 'string' || !isObjectId(sha)) throw unprocessable('Validation Failed: sha is required');
+  const object = repo.objects.get(sha);
+  if (!object || (object.type !== 'commit' && object.type !== 'tag')) {
+    throw unprocessable('Validation Failed: sha does not name a commit');
+  }
+  if (repo.refs.has(ref)) throw unprocessable(`Validation Failed: ${ref} already exists`);
+  repo.refs.set(ref, sha);
+  return jsonReply(201, { ref, object: { sha } });
+}
+
+/**
+ * GET /api/v3/repos/{o}/{r}/git/refs/{ref...} — one ref (e.g. heads/main).
+ * Answers `{ref, object: {sha}, sha}` (all three shapes, for every reader).
+ * 404 when the ref is absent.
+ */
+export function getGitRef(store: ForgeStore, owner: string, name: string, refPath: string): Reply {
+  const repo = requireRepo(store, owner, name);
+  const ref = `refs/${refPath}`;
+  const sha = repo.refs.get(ref);
+  if (!sha) throw notFound('Not Found');
+  return jsonReply(200, { ref, object: { sha }, sha });
 }
