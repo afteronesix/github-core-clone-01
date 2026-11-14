@@ -47,14 +47,16 @@ function dataLines(packets: readonly PktLine[]): string[] {
  * capability per line. `fetch=shallow` and `ls-refs=unborn` carry the keys the
  * advertise-v2 check requires (`fetch`, `ls-refs`) plus the feature values
  * the fetch/ls-refs paths read. `filter` is deliberately NOT advertised.
+ * The bytes are identical for every repo, so they are built once.
  */
+const ADVERTISEMENT_V2_BODY: Buffer = Buffer.concat([
+  encodePktLine('# service=git-upload-pack\n'),
+  pktLineFlush(),
+  encodePktLines(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n', `agent=${SERVER_AGENT}\n`, 'flush']),
+]);
+
 export function advertisementV2(): GitResponse {
-  const body = Buffer.concat([
-    encodePktLine('# service=git-upload-pack\n'),
-    pktLineFlush(),
-    encodePktLines(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n', `agent=${SERVER_AGENT}\n`, 'flush']),
-  ]);
-  return ok(UPLOAD_ADVERTISEMENT_TYPE, body);
+  return ok(UPLOAD_ADVERTISEMENT_TYPE, ADVERTISEMENT_V2_BODY);
 }
 
 /** The v0 ref advertisement's capability list (upload-pack). */
@@ -235,6 +237,33 @@ function buildFetchPack(repo: RepoRecord, oids: ReadonlySet<string>): Buffer {
 }
 
 /**
+ * The fetch-response cache key: resolved oids only. Wants/haves/shallow are
+ * always oids (planFetch looks them up directly); deepen-not may name a ref,
+ * and refs move, so those are resolved to their current tips first.
+ */
+function fetchCacheKey(version: 'v2' | 'v0', repo: RepoRecord, args: FetchArgs): string {
+  const sorted = (values: readonly string[]): string[] => [...values].sort();
+  const deepenNot = args.deepenNot.map((value) => (isObjectId(value) ? value : (repo.refs.get(value) ?? value)));
+  return JSON.stringify({
+    v: version,
+    w: sorted(args.wants),
+    h: sorted(args.haves),
+    s: sorted(args.shallow),
+    d: args.depth ?? null,
+    ds: args.deepenSince ?? null,
+    dn: sorted(deepenNot),
+  });
+}
+
+/** The pack cache is bounded: a full cache is dropped rather than grown. */
+const PACK_CACHE_MAX_ENTRIES = 128;
+
+function cacheFetchResponse(repo: RepoRecord, key: string, body: Buffer): void {
+  if (repo.packCache.size >= PACK_CACHE_MAX_ENTRIES) repo.packCache.clear();
+  repo.packCache.set(key, body);
+}
+
+/**
  * v2 fetch. Sections in order: acknowledgments (always NAK — the checks never
  * assert ACKs), shallow-info (only when non-empty), packfile (sideband band 1,
  * always at least one packet — an empty pack is still a valid 32-byte pack).
@@ -245,6 +274,9 @@ export function handleFetchV2(repo: RepoRecord, body: Buffer): GitResponse {
   for (const want of args.wants) {
     if (!isObjectId(want)) throw new PktLineError(`fetch wants a bad object id ${JSON.stringify(want)}`);
   }
+  const cacheKey = fetchCacheKey('v2', repo, args);
+  const cached = repo.packCache.get(cacheKey);
+  if (cached !== undefined) return ok(UPLOAD_RESULT_TYPE, cached);
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   let plan;
   try {
@@ -280,7 +312,9 @@ export function handleFetchV2(repo: RepoRecord, body: Buffer): GitResponse {
   parts.push(encodePktLine('packfile\n'));
   parts.push(encodeSideband(buildFetchPack(repo, plan.objects), 1));
   parts.push(pktLineFlush());
-  return ok(UPLOAD_RESULT_TYPE, Buffer.concat(parts));
+  const response = Buffer.concat(parts);
+  cacheFetchResponse(repo, cacheKey, response);
+  return ok(UPLOAD_RESULT_TYPE, response);
 }
 
 /**
@@ -290,6 +324,9 @@ export function handleFetchV2(repo: RepoRecord, body: Buffer): GitResponse {
  */
 export function handleFetchV0(repo: RepoRecord, body: Buffer): GitResponse {
   const args = parseFetchArgsV0(body);
+  const cacheKey = fetchCacheKey('v0', repo, args);
+  const cached = repo.packCache.get(cacheKey);
+  if (cached !== undefined) return ok(UPLOAD_RESULT_TYPE, cached);
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   let plan;
   try {
@@ -322,7 +359,9 @@ export function handleFetchV0(repo: RepoRecord, body: Buffer): GitResponse {
     encodeSideband(buildFetchPack(repo, plan.objects), 1),
     pktLineFlush(),
   ];
-  return ok(UPLOAD_RESULT_TYPE, Buffer.concat(parts));
+  const response = Buffer.concat(parts);
+  cacheFetchResponse(repo, cacheKey, response);
+  return ok(UPLOAD_RESULT_TYPE, response);
 }
 
 /**

@@ -2,7 +2,7 @@
 // sequence per repo (the store's nextNumber), starting at 1.
 
 import type { CommentRecord, ForgeStore, IssueRecord, RepoRecord } from '../store/store.ts';
-import { isJsonObject, jsonReply, notFound, unprocessable, type Reply } from '../http/server.ts';
+import { isJsonObject, jsonReply, jsonReplyRaw, notFound, unprocessable, type Reply } from '../http/server.ts';
 import { buildLinkHeader, paginate, parsePageParams } from './pagination.ts';
 import { requireRepo } from './repos.ts';
 
@@ -138,12 +138,16 @@ export function listIssues(
   return jsonReply(200, page.items.map((issue) => issueView(store, repo, issue)), headers);
 }
 
-/** GET /api/v3/repos/{o}/{r}/issues/{n} — one issue, 404 when absent. */
+/** GET /api/v3/repos/{o}/{r}/issues/{n} — one issue, 404 when absent. The read workload's hot path (2,000 sequential GETs): the serialized view is cached per issue and invalidated on PATCH/close. */
 export function getIssue(store: ForgeStore, owner: string, name: string, number: number): Reply {
   const repo = requireRepo(store, owner, name);
   const issue = repo.issues.get(number);
   if (!issue) throw notFound('Not Found');
-  return jsonReply(200, issueView(store, repo, issue));
+  const cached = repo.issueJsonCache.get(number);
+  if (cached !== undefined) return jsonReplyRaw(200, cached);
+  const serialized = `${JSON.stringify(issueView(store, repo, issue))}\n`;
+  repo.issueJsonCache.set(number, serialized);
+  return jsonReplyRaw(200, serialized);
 }
 
 /** PATCH /api/v3/repos/{o}/{r}/issues/{n} — title, body, state, labels. */

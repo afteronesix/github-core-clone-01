@@ -100,6 +100,11 @@ export function jsonReply(status: number, body: unknown, headers: Readonly<Recor
   return { status, contentType: JSON_TYPE, body: Buffer.from(`${JSON.stringify(body)}\n`, 'utf8'), headers };
 }
 
+/** A JSON reply from an already-serialized body (the issue read cache). */
+export function jsonReplyRaw(status: number, body: string, headers: Readonly<Record<string, string>> = {}): Reply {
+  return { status, contentType: JSON_TYPE, body: Buffer.from(body, 'utf8'), headers };
+}
+
 /** A JSON error reply: `{"message": string}`. */
 export function errorReply(status: number, message: string): Reply {
   return jsonReply(status, { message });

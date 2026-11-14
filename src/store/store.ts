@@ -81,6 +81,14 @@ export interface RepoRecord {
   nextNumber: number;
   /** Cached serialized issue JSON (the read workload's hot path); cleared on PATCH. */
   readonly issueJsonCache: Map<number, string>;
+  /**
+   * Cached fetch responses, keyed by the resolved fetch arguments. Safe
+   * without invalidation: git objects are immutable and content-addressed, a
+   * want's reachable closure is fixed once the want exists, the store never
+   * deletes objects, and a repo deletion drops the whole record (cache with
+   * it). The clone workload's 50 identical depth-1 clones hit one entry.
+   */
+  readonly packCache: Map<string, Buffer>;
 }
 
 export class ForgeStore {
@@ -170,6 +178,7 @@ export class ForgeStore {
       pulls: new Map(),
       nextNumber: 1,
       issueJsonCache: new Map(),
+      packCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     this.creationOrder.push(repo);
