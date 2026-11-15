@@ -113,12 +113,9 @@ export function createApp(): Server {
   const store = new ForgeStore();
   const auth = createAuthGate(process.env.MAKEFUN_SHOP_TOKEN);
 
-  const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const handler = (req: IncomingMessage, res: ServerResponse): void => {
     const requestId = store.nextRequest();
-    try {
-      const reply = await dispatch(req, store, auth);
-      sendReply(res, reply, requestId);
-    } catch (err) {
+    const sendError = (err: unknown): void => {
       if (err instanceof HttpError) {
         sendReply(res, errorReply(err.status, err.message), requestId);
         return;
@@ -130,19 +127,56 @@ export function createApp(): Server {
       // A handler throw must answer 500 JSON, never kill the process.
       process.stderr.write(`[forge] unhandled error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
       sendReply(res, errorReply(500, 'Internal Server Error'), requestId);
+    };
+    try {
+      // Route memo: a repeated identical GET skips URL parsing and routing
+      // and goes straight to its handler. Auth still runs first, and the
+      // handler re-validates all state (repo/issue existence, cache
+      // freshness), so the memo needs no invalidation. Body-less GETs also
+      // skip the async machinery: dispatch returns a Reply synchronously
+      // and only body-reading routes return a promise.
+      if (req.method === 'GET') {
+        const memo = store.routeMemo;
+        if (memo !== null && req.url === memo.url) {
+          if (!auth.isAuthorized(req)) throw unauthorized();
+          if (memo.kind === 'issue') {
+            sendReply(res, getIssue(store, memo.owner, memo.name, memo.number), requestId);
+            return;
+          }
+          const memoRepo = store.getRepo(memo.owner, memo.name);
+          if (!memoRepo) throw notFound('Not Found');
+          if (memo.service === 'git-upload-pack') {
+            sendReply(res, gitProtocolVersion(req) === 2 ? advertisementV2() : advertisementV0(memoRepo), requestId);
+            return;
+          }
+          sendReply(res, advertisementReceivePack(memoRepo), requestId);
+          return;
+        }
+      }
+      const reply = dispatch(req, store, auth);
+      if (reply instanceof Promise) {
+        reply.then(
+          (resolved) => sendReply(res, resolved, requestId),
+          (err: unknown) => sendError(err),
+        );
+      } else {
+        sendReply(res, reply, requestId);
+      }
+    } catch (err) {
+      sendError(err);
     }
   };
 
   return createServer((req, res) => {
-    void handler(req, res);
+    handler(req, res);
   });
 }
 
-async function dispatch(
+function dispatch(
   req: IncomingMessage,
   store: ForgeStore,
   auth: ReturnType<typeof createAuthGate>,
-): Promise<Reply> {
+): Reply | Promise<Reply> {
   const { path, query } = splitRequestTarget(req);
   const method = req.method ?? 'GET';
   // Query params are parsed lazily — only the list endpoints and info/refs
@@ -173,6 +207,9 @@ async function dispatch(
         if (service === 'info/refs') {
           if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
           const serviceParam = searchParams().get('service');
+          if (serviceParam === 'git-upload-pack' || serviceParam === 'git-receive-pack') {
+            store.routeMemo = { kind: 'info-refs', url: req.url ?? '', owner, name: repoName, service: serviceParam };
+          }
           if (serviceParam === 'git-upload-pack') {
             return gitProtocolVersion(req) === 2 ? advertisementV2() : advertisementV0(repo);
           }
@@ -180,9 +217,10 @@ async function dispatch(
           throw notFound('Not Found');
         }
         if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-        const body = await readBody(req);
-        if (service === 'git-upload-pack') return handleUploadPack(repo, body, gitProtocolVersion(req));
-        return handleReceivePack(repo, body);
+        if (service === 'git-upload-pack') {
+          return readBody(req).then((body) => handleUploadPack(repo, body, gitProtocolVersion(req)));
+        }
+        return readBody(req).then((body) => handleReceivePack(repo, body));
       }
     }
   }
@@ -201,7 +239,7 @@ async function dispatch(
     return getUser(store);
   }
   if (path === '/api/v3/user/repos') {
-    if (method === 'POST') return createRepo(store, parseJsonBody(await readBody(req)));
+    if (method === 'POST') return readBody(req).then((body) => createRepo(store, parseJsonBody(body)));
     if (method === 'GET') return listUserRepos(store, searchParams(), originOf(req));
     throw new HttpError(405, 'Method Not Allowed');
   }
@@ -219,7 +257,9 @@ async function dispatch(
         if (afterOwner.length > 0) {
           const decodedRepo = decodePath(afterOwner);
           if (method === 'GET') return getRepo(store, decodedOwner, decodedRepo);
-          if (method === 'PATCH') return patchRepo(store, decodedOwner, decodedRepo, parseJsonBody(await readBody(req)));
+          if (method === 'PATCH') {
+            return readBody(req).then((body) => patchRepo(store, decodedOwner, decodedRepo, parseJsonBody(body)));
+          }
           if (method === 'DELETE') return deleteRepo(store, decodedOwner, decodedRepo);
           throw new HttpError(405, 'Method Not Allowed');
         }
@@ -236,7 +276,7 @@ async function dispatch(
   // --- GraphQL v4 ------------------------------------------------------------
   if (path === '/api/graphql') {
     if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-    return handleGraphQL(store, parseJsonBody(await readBody(req)));
+    return readBody(req).then((body) => handleGraphQL(store, parseJsonBody(body)));
   }
 
   // --- MCP (JSON-RPC over Streamable HTTP) -----------------------------------
@@ -245,7 +285,7 @@ async function dispatch(
     if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
     // handleMcp parses the raw body itself: a non-JSON body must answer
     // HTTP 400 with JSON-RPC -32700, not the REST 400 shape.
-    return handleMcp(store, await readBody(req));
+    return readBody(req).then((body) => handleMcp(store, body));
   }
 
   // Everything else, every method: GitHub's 404 body.
@@ -257,7 +297,7 @@ async function dispatch(
  * The numeric sub-routes parse `rest` once (split + digit check) instead of
  * running a regex per route — same match set, same 404/405 outcomes.
  */
-async function dispatchRepoSub(
+function dispatchRepoSub(
   req: IncomingMessage,
   store: ForgeStore,
   method: string,
@@ -267,7 +307,7 @@ async function dispatchRepoSub(
   rest: string,
   searchParams: URLSearchParams,
   origin: string,
-): Promise<Reply> {
+): Reply | Promise<Reply> {
   if (rest === 'branches') {
     if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
     return listBranches(store, owner, repoName);
@@ -282,7 +322,7 @@ async function dispatchRepoSub(
   }
   if (rest === 'git/refs') {
     if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-    return createGitRef(store, owner, repoName, parseJsonBody(await readBody(req)));
+    return readBody(req).then((body) => createGitRef(store, owner, repoName, parseJsonBody(body)));
   }
   if (rest.startsWith('git/refs/')) {
     if (method !== 'GET') throw new HttpError(405, 'Method Not Allowed');
@@ -291,22 +331,24 @@ async function dispatchRepoSub(
   if (rest === 'contents' || rest.startsWith('contents/')) {
     const filePath = rest === 'contents' ? '' : decodePath(rest.slice('contents/'.length));
     if (method === 'GET') return getContents(repo, filePath, searchParams);
-    if (method === 'PUT') return putContents(store, repo, filePath, parseJsonBody(await readBody(req)));
-    if (method === 'DELETE') return deleteContents(store, repo, filePath, parseJsonBody(await readBody(req)));
+    if (method === 'PUT') return readBody(req).then((body) => putContents(store, repo, filePath, parseJsonBody(body)));
+    if (method === 'DELETE') {
+      return readBody(req).then((body) => deleteContents(store, repo, filePath, parseJsonBody(body)));
+    }
     throw new HttpError(405, 'Method Not Allowed');
   }
   if (rest === 'labels') {
     if (method !== 'POST') throw new HttpError(405, 'Method Not Allowed');
-    return createLabel(store, owner, repoName, parseJsonBody(await readBody(req)));
+    return readBody(req).then((body) => createLabel(store, owner, repoName, parseJsonBody(body)));
   }
   if (rest === 'issues') {
     if (method === 'GET') return listIssues(store, owner, repoName, searchParams, origin);
-    if (method === 'POST') return createIssue(store, owner, repoName, parseJsonBody(await readBody(req)));
+    if (method === 'POST') return readBody(req).then((body) => createIssue(store, owner, repoName, parseJsonBody(body)));
     throw new HttpError(405, 'Method Not Allowed');
   }
   if (rest === 'pulls') {
     if (method === 'GET') return listPulls(store, owner, repoName, searchParams, origin);
-    if (method === 'POST') return createPull(store, owner, repoName, parseJsonBody(await readBody(req)));
+    if (method === 'POST') return readBody(req).then((body) => createPull(store, owner, repoName, parseJsonBody(body)));
     throw new HttpError(405, 'Method Not Allowed');
   }
   // Numeric sub-routes: issues/N, issues/N/comments, pulls/N, pulls/N/files,
@@ -316,16 +358,19 @@ async function dispatchRepoSub(
     const number = parseUint(parts[1] as string);
     if (number !== null) {
       if (parts[0] === 'issues' && parts.length === 2) {
-        if (method === 'GET') return getIssue(store, owner, repoName, number);
+        if (method === 'GET') {
+          store.routeMemo = { kind: 'issue', url: req.url ?? '', owner, name: repoName, number };
+          return getIssue(store, owner, repoName, number);
+        }
         if (method === 'PATCH') {
-          return patchIssue(store, owner, repoName, number, parseJsonBody(await readBody(req)));
+          return readBody(req).then((body) => patchIssue(store, owner, repoName, number, parseJsonBody(body)));
         }
         throw new HttpError(405, 'Method Not Allowed');
       }
       if (parts[0] === 'issues' && parts.length === 3 && parts[2] === 'comments') {
         if (method === 'GET') return listComments(store, owner, repoName, number);
         if (method === 'POST') {
-          return createComment(store, owner, repoName, number, parseJsonBody(await readBody(req)));
+          return readBody(req).then((body) => createComment(store, owner, repoName, number, parseJsonBody(body)));
         }
         throw new HttpError(405, 'Method Not Allowed');
       }
@@ -339,7 +384,7 @@ async function dispatchRepoSub(
       }
       if (parts[0] === 'pulls' && parts.length === 3 && parts[2] === 'merge') {
         if (method !== 'PUT') throw new HttpError(405, 'Method Not Allowed');
-        return mergePull(store, owner, repoName, number, parseJsonBody(await readBody(req)));
+        return readBody(req).then((body) => mergePull(store, owner, repoName, number, parseJsonBody(body)));
       }
     }
   }

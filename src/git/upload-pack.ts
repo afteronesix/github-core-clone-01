@@ -5,7 +5,7 @@
 import { decodePktLines, encodePktLine, encodePktLines, encodeSideband, pktLineFlush, PktLineError, type PktLine } from './pktline.ts';
 import { emptyPack, writePack } from './pack.ts';
 import { GitObjectError, isObjectId, planFetch, ZERO_OID, type GitObject } from './objects.ts';
-import { headOid, headTarget, listRefs, peelTag } from './refs.ts';
+import { headOid, headTarget, listRefs, peelTag, refSetKey } from './refs.ts';
 import type { RepoRecord } from '../store/store.ts';
 
 export interface GitResponse {
@@ -63,13 +63,21 @@ export function advertisementV2(): GitResponse {
 /** The v0 ref advertisement's capability list (upload-pack). */
 export const UPLOAD_V0_CAPABILITIES = `symref=HEAD:refs/heads/main side-band-64k ofs-delta thin-pack shallow agent=${SERVER_AGENT}`;
 
+/** The advertisement cache is bounded: a full cache is dropped rather than grown. */
+export const ADVERT_CACHE_MAX_ENTRIES = 64;
+
 /**
  * The v0 ref advertisement: service preamble, then ref lines. The FIRST line
  * carries the capabilities after a NUL. HEAD comes first, then refs sorted;
  * an annotated tag is followed by its peeled `<oid> <ref>^{}` line. An empty
  * repo advertises only `ZERO capabilities^{}` carrying the capabilities.
+ * Cached per ref set (advertCache, `U|` prefix): the bytes depend only on the
+ * refs, and the push workload's info/refs GETs repeat the same ref set.
  */
 export function advertisementV0(repo: RepoRecord): GitResponse {
+  const cacheKey = `U|${refSetKey(repo)}`;
+  const cached = repo.advertCache.get(cacheKey);
+  if (cached !== undefined) return ok(UPLOAD_ADVERTISEMENT_TYPE, cached);
   const refs = listRefs(repo);
   const lines: string[] = [];
   if (refs.length === 0) {
@@ -84,6 +92,8 @@ export function advertisementV0(repo: RepoRecord): GitResponse {
     }
   }
   const body = encodePktLines(['# service=git-upload-pack\n', 'flush', ...lines, 'flush']);
+  if (repo.advertCache.size >= ADVERT_CACHE_MAX_ENTRIES) repo.advertCache.clear();
+  repo.advertCache.set(cacheKey, body);
   return ok(UPLOAD_ADVERTISEMENT_TYPE, body);
 }
 
@@ -144,8 +154,7 @@ export function handleLsRefs(repo: RepoRecord, packets: readonly PktLine[]): Git
   // the default branch never changes. A different insertion order only
   // costs a cache miss, never a wrong hit. The clone workload's 50
   // identical ls-refs calls hit one entry.
-  let cacheKey = `${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}|`;
-  for (const [name, oid] of repo.refs) cacheKey += `${name}=${oid};`;
+  const cacheKey = `${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}|${refSetKey(repo)}`;
   const cached = repo.lsRefsCache.get(cacheKey);
   if (cached !== undefined) return ok(UPLOAD_RESULT_TYPE, cached);
   const keep = (name: string): boolean =>

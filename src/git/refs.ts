@@ -27,6 +27,18 @@ export function listRefs(repo: RepoRecord): ListedRef[] {
   return refs;
 }
 
+/**
+ * The ref set as a cache-key string (`name=oid;` pairs, Map order). Two repos
+ * with the same key have the same refs, so any response derived only from the
+ * ref set (advertisements, ls-refs) is identical for them. A different
+ * insertion order only costs a cache miss, never a wrong hit.
+ */
+export function refSetKey(repo: RepoRecord): string {
+  let key = '';
+  for (const [name, oid] of repo.refs) key += `${name}=${oid};`;
+  return key;
+}
+
 export function getRef(repo: RepoRecord, name: string): string | undefined {
   return repo.refs.get(name);
 }

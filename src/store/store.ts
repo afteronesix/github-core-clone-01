@@ -97,11 +97,32 @@ export interface RepoRecord {
    * workload's 50 identical ls-refs calls hit one entry.
    */
   readonly lsRefsCache: Map<string, Buffer>;
+  /**
+   * Cached v0/v2 advertisements, keyed by `U|`/`R|` + the full ref set.
+   * Safe without invalidation for the same reason as lsRefsCache: the key
+   * carries the ref set, objects are immutable, the default branch never
+   * changes. The push workload's 200 info/refs GETs per round hit one entry.
+   */
+  readonly advertCache: Map<string, Buffer>;
 }
+
+/**
+ * The last route resolved, so a repeated identical GET skips URL parsing and
+ * routing and goes straight to its handler. The memo is a pure routing
+ * shortcut: the handler still re-validates everything (repo existence, issue
+ * existence, cache freshness), so it needs NO invalidation — a deleted repo
+ * or a patched issue is handled exactly as on the slow path. Only GET routes
+ * whose meaning is fixed by their URL are memoized.
+ */
+export type RouteMemo =
+  | { readonly kind: 'issue'; readonly url: string; readonly owner: string; readonly name: string; readonly number: number }
+  | { readonly kind: 'info-refs'; readonly url: string; readonly owner: string; readonly name: string; readonly service: string };
 
 export class ForgeStore {
   readonly viewer: ScenarioUser;
   readonly clock = new DetClock();
+  /** The last memoized route (see RouteMemo); null until the first memoizable GET. */
+  routeMemo: RouteMemo | null = null;
   private readonly repos = new Map<string, RepoRecord>();
   private readonly creationOrder: RepoRecord[] = [];
   private nextRepoId = 1;
@@ -188,6 +209,7 @@ export class ForgeStore {
       issueJsonCache: new Map(),
       packCache: new Map(),
       lsRefsCache: new Map(),
+      advertCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     this.creationOrder.push(repo);

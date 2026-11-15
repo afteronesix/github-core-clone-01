@@ -5,8 +5,8 @@
 import { decodePktLines, encodePktLines, encodeSideband, pktLineFlush, PktLineError, type PktLine } from './pktline.ts';
 import { readPack } from './pack.ts';
 import { GitObjectError, isObjectId, ZERO_OID } from './objects.ts';
-import { checkFastForward, deleteRef, headOid, isRefTarget, listRefs, peelTag, setRef } from './refs.ts';
-import { RECEIVE_ADVERTISEMENT_TYPE, RECEIVE_RESULT_TYPE, SERVER_AGENT, type GitResponse } from './upload-pack.ts';
+import { checkFastForward, deleteRef, headOid, isRefTarget, listRefs, peelTag, refSetKey, setRef } from './refs.ts';
+import { ADVERT_CACHE_MAX_ENTRIES, RECEIVE_ADVERTISEMENT_TYPE, RECEIVE_RESULT_TYPE, SERVER_AGENT, type GitResponse } from './upload-pack.ts';
 import type { RepoRecord } from '../store/store.ts';
 
 /** The receive-pack v0 capability list. `report-status-v2` is NOT advertised. */
@@ -15,9 +15,14 @@ export const RECEIVE_V0_CAPABILITIES = `report-status side-band-64k delete-refs 
 /**
  * The receive-pack v0 advertisement: service preamble, then ref lines, the
  * first carrying the capabilities after a NUL. An empty repo advertises only
- * `ZERO capabilities^{}` with the capabilities.
+ * `ZERO capabilities^{}` with the capabilities. Cached per ref set
+ * (advertCache, `R|` prefix): the bytes depend only on the refs, and the
+ * push workload fetches this advertisement before every push.
  */
 export function advertisementReceivePack(repo: RepoRecord): GitResponse {
+  const cacheKey = `R|${refSetKey(repo)}`;
+  const cached = repo.advertCache.get(cacheKey);
+  if (cached !== undefined) return { status: 200, contentType: RECEIVE_ADVERTISEMENT_TYPE, body: cached };
   const refs = listRefs(repo);
   const lines: string[] = [];
   if (refs.length === 0) {
@@ -32,6 +37,8 @@ export function advertisementReceivePack(repo: RepoRecord): GitResponse {
     }
   }
   const body = encodePktLines(['# service=git-receive-pack\n', 'flush', ...lines, 'flush']);
+  if (repo.advertCache.size >= ADVERT_CACHE_MAX_ENTRIES) repo.advertCache.clear();
+  repo.advertCache.set(cacheKey, body);
   return { status: 200, contentType: RECEIVE_ADVERTISEMENT_TYPE, body };
 }
 
